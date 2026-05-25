@@ -28,7 +28,7 @@ def extract_text(pdf_file):
     except Exception as e:
         return f"Error: {str(e)}"
 
-def split_text(text, chunk_size=500):
+def split_text(text, chunk_size=1000):
     sentences = re.split(r'(?<=[.!?])\s+', text)
     chunks_list = []
     current = ""
@@ -45,13 +45,12 @@ def split_text(text, chunk_size=500):
 
 def tokenize(text):
     text = text.lower()
-    text = re.sub(r'[^a-z0-9\s]', '', text)
+    text = re.sub(r'[^a-z0-9\s]', ' ', text)
     return text.split()
 
 def compute_tfidf(docs):
     global vocab, idf, tfidf_vectors
     
-    # Build vocabulary
     vocab = {}
     doc_freq = {}
     for doc in docs:
@@ -61,9 +60,8 @@ def compute_tfidf(docs):
     
     vocab = {token: idx for idx, token in enumerate(doc_freq.keys())}
     N = len(docs)
-    idf = {token: math.log(N / df) for token, df in doc_freq.items()}
+    idf = {token: math.log((N + 1) / (df + 1)) + 1 for token, df in doc_freq.items()}
     
-    # Compute TF-IDF vectors
     tfidf_vectors = []
     for doc in docs:
         tokens = tokenize(doc)
@@ -87,43 +85,54 @@ def cosine_similarity(vec1, vec2):
         return 0
     return dot / (mag1 * mag2)
 
-def get_relevant_chunks(query, chunks, k=3):
+def get_relevant_chunks(query, chunks_list, k=3):
+    global vocab, idf, tfidf_vectors
+    
     query_lower = query.lower()
     query_words = set(query_lower.split())
     
     # Check if it's a "summary" or "about" question
-    summary_keywords = ['about', 'summarize', 'summary', 'what is this', 'main topic', 'overview']
+    summary_keywords = ['about', 'summarize', 'summary', 'what is this', 'main topic', 'overview', 'what is this pdf', 'what is this document']
     is_summary_question = any(kw in query_lower for kw in summary_keywords)
     
     # For summary questions, return first chunks (beginning of doc)
     if is_summary_question:
-        return chunks[:k]
+        return chunks_list[:k]
     
-    # For specific questions, use keyword matching
+    # For specific questions, use TF-IDF + cosine similarity
+    q_tokens = tokenize(query)
+    q_tf = {}
+    for t in q_tokens:
+        q_tf[t] = q_tf.get(t, 0) + 1
+    
+    q_vec = {}
+    for token, idx in vocab.items():
+        tf_val = q_tf.get(token, 0) / len(q_tokens) if q_tokens else 0
+        q_vec[idx] = tf_val * idf.get(token, 0)
+    
     scores = []
-    for i, chunk in enumerate(chunks):
-        chunk_words = set(chunk.lower().split())
-        score = len(query_words & chunk_words)
+    for i, doc_vec in enumerate(tfidf_vectors):
+        score = cosine_similarity(q_vec, doc_vec)
         scores.append((score, i))
     
     scores.sort(reverse=True)
     
     # If no good matches, return first chunks as fallback
     if not scores or scores[0][0] == 0:
-        return chunks[:k]
+        return chunks_list[:k]
     
-    return [chunks[i] for _, i in scores[:k]]
+    return [chunks_list[i] for _, i in scores[:k]]
 
 def ask_gemini(api_key, question, context):
     genai.configure(api_key=api_key)
     gemini_model = genai.GenerativeModel('gemini-2.5-flash')
     
     # Detect summary questions
-    summary_keywords = ['about', 'summarize', 'summary', 'what is this', 'main topic', 'overview']
+    summary_keywords = ['about', 'summarize', 'summary', 'what is this', 'main topic', 'overview', 'what is this pdf', 'what is this document']
     is_summary = any(kw in question.lower() for kw in summary_keywords)
     
     if is_summary:
-        prompt = f"""Based on the following document excerpts, provide a brief summary of what this document is about.
+        prompt = f"""Based on the following document excerpts, provide a brief summary of what this document is about. Be concise but informative.
 
 Document excerpts:
 {context}
@@ -144,7 +153,8 @@ Answer:"""
         return response.text
     except Exception as e:
         return f"Error: {str(e)}"
-        
+
+@app.route('/')
 def home():
     return render_template('index.html')
 
