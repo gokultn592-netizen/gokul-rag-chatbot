@@ -88,41 +88,63 @@ def cosine_similarity(vec1, vec2):
     return dot / (mag1 * mag2)
 
 def get_relevant_chunks(query, chunks, k=3):
-    q_tokens = tokenize(query)
-    q_tf = {}
-    for t in q_tokens:
-        q_tf[t] = q_tf.get(t, 0) + 1
+    query_lower = query.lower()
+    query_words = set(query_lower.split())
     
-    q_vec = {}
-    for token, idx in vocab.items():
-        tf_val = q_tf.get(token, 0) / len(q_tokens) if q_tokens else 0
-        q_vec[idx] = tf_val * idf.get(token, 0)
+    # Check if it's a "summary" or "about" question
+    summary_keywords = ['about', 'summarize', 'summary', 'what is this', 'main topic', 'overview']
+    is_summary_question = any(kw in query_lower for kw in summary_keywords)
     
+    # For summary questions, return first chunks (beginning of doc)
+    if is_summary_question:
+        return chunks[:k]
+    
+    # For specific questions, use keyword matching
     scores = []
-    for i, doc_vec in enumerate(tfidf_vectors):
-        score = cosine_similarity(q_vec, doc_vec)
+    for i, chunk in enumerate(chunks):
+        chunk_words = set(chunk.lower().split())
+        score = len(query_words & chunk_words)
         scores.append((score, i))
     
     scores.sort(reverse=True)
+    
+    # If no good matches, return first chunks as fallback
+    if not scores or scores[0][0] == 0:
+        return chunks[:k]
+    
     return [chunks[i] for _, i in scores[:k]]
 
 def ask_gemini(api_key, question, context):
     genai.configure(api_key=api_key)
     gemini_model = genai.GenerativeModel('gemini-2.5-flash')
-    prompt = f"""Answer based ONLY on this context. If not found, say "I don't have enough information."
+    
+    # Detect summary questions
+    summary_keywords = ['about', 'summarize', 'summary', 'what is this', 'main topic', 'overview']
+    is_summary = any(kw in question.lower() for kw in summary_keywords)
+    
+    if is_summary:
+        prompt = f"""Based on the following document excerpts, provide a brief summary of what this document is about.
 
-Context: {context}
+Document excerpts:
+{context}
+
+Summary:"""
+    else:
+        prompt = f"""Answer the question based ONLY on the provided context. If the answer is not in the context, say "I don't have enough information."
+
+Context:
+{context}
 
 Question: {question}
 
 Answer:"""
+    
     try:
         response = gemini_model.generate_content(prompt)
         return response.text
     except Exception as e:
         return f"Error: {str(e)}"
-
-@app.route('/')
+        
 def home():
     return render_template('index.html')
 
