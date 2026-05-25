@@ -2,9 +2,7 @@ from flask import Flask, render_template, request, jsonify
 import os
 from dotenv import load_dotenv
 from PyPDF2 import PdfReader
-import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+import math
 import re
 import google.generativeai as genai
 
@@ -14,8 +12,9 @@ app = Flask(__name__)
 
 # Global storage
 chunks = []
-vectorizer = None
-tfidf_matrix = None
+tfidf_vectors = []
+idf = {}
+vocab = {}
 
 def extract_text(pdf_file):
     try:
@@ -44,20 +43,72 @@ def split_text(text, chunk_size=500):
         chunks_list.append(current.strip())
     return chunks_list
 
-def create_tfidf(chunks_list):
-    vect = TfidfVectorizer(stop_words='english', max_features=5000)
-    matrix = vect.fit_transform(chunks_list)
-    return vect, matrix
+def tokenize(text):
+    text = text.lower()
+    text = re.sub(r'[^a-z0-9\s]', '', text)
+    return text.split()
 
-def get_relevant_chunks(query, vect, matrix, chunks_list, k=3):
-    query_vec = vect.transform([query])
-    similarities = cosine_similarity(query_vec, matrix).flatten()
-    top_indices = similarities.argsort()[-k:][::-1]
-    return [chunks_list[i] for i in top_indices]
+def compute_tfidf(docs):
+    global vocab, idf, tfidf_vectors
+    
+    # Build vocabulary
+    vocab = {}
+    doc_freq = {}
+    for doc in docs:
+        tokens = set(tokenize(doc))
+        for token in tokens:
+            doc_freq[token] = doc_freq.get(token, 0) + 1
+    
+    vocab = {token: idx for idx, token in enumerate(doc_freq.keys())}
+    N = len(docs)
+    idf = {token: math.log(N / df) for token, df in doc_freq.items()}
+    
+    # Compute TF-IDF vectors
+    tfidf_vectors = []
+    for doc in docs:
+        tokens = tokenize(doc)
+        tf = {}
+        for t in tokens:
+            tf[t] = tf.get(t, 0) + 1
+        
+        vec = {}
+        for token, idx in vocab.items():
+            tf_val = tf.get(token, 0) / len(tokens) if tokens else 0
+            vec[idx] = tf_val * idf.get(token, 0)
+        tfidf_vectors.append(vec)
+    
+    return tfidf_vectors
+
+def cosine_similarity(vec1, vec2):
+    dot = sum(vec1.get(k, 0) * vec2.get(k, 0) for k in set(vec1) | set(vec2))
+    mag1 = math.sqrt(sum(v**2 for v in vec1.values()))
+    mag2 = math.sqrt(sum(v**2 for v in vec2.values()))
+    if mag1 == 0 or mag2 == 0:
+        return 0
+    return dot / (mag1 * mag2)
+
+def get_relevant_chunks(query, chunks, k=3):
+    q_tokens = tokenize(query)
+    q_tf = {}
+    for t in q_tokens:
+        q_tf[t] = q_tf.get(t, 0) + 1
+    
+    q_vec = {}
+    for token, idx in vocab.items():
+        tf_val = q_tf.get(token, 0) / len(q_tokens) if q_tokens else 0
+        q_vec[idx] = tf_val * idf.get(token, 0)
+    
+    scores = []
+    for i, doc_vec in enumerate(tfidf_vectors):
+        score = cosine_similarity(q_vec, doc_vec)
+        scores.append((score, i))
+    
+    scores.sort(reverse=True)
+    return [chunks[i] for _, i in scores[:k]]
 
 def ask_gemini(api_key, question, context):
     genai.configure(api_key=api_key)
-    gemini_model = genai.GenerativeModel('gemini-2.5-flash-lite')
+    gemini_model = genai.GenerativeModel('gemini-2.5-flash')
     prompt = f"""Answer based ONLY on this context. If not found, say "I don't have enough information."
 
 Context: {context}
@@ -77,7 +128,7 @@ def home():
 
 @app.route('/upload', methods=['POST'])
 def upload():
-    global chunks, vectorizer, tfidf_matrix
+    global chunks, tfidf_vectors, idf, vocab
     
     if 'files' not in request.files:
         return jsonify({'error': 'No files uploaded'})
@@ -99,7 +150,7 @@ def upload():
     if not all_chunks:
         return jsonify({'error': 'No text extracted from PDFs'})
     
-    vectorizer, tfidf_matrix = create_tfidf(all_chunks)
+    compute_tfidf(all_chunks)
     chunks = all_chunks
     
     return jsonify({
@@ -109,9 +160,9 @@ def upload():
 
 @app.route('/chat', methods=['POST'])
 def chat():
-    global chunks, vectorizer, tfidf_matrix
+    global chunks, tfidf_vectors
     
-    if not chunks or vectorizer is None:
+    if not chunks or not tfidf_vectors:
         return jsonify({'error': 'Please upload PDFs first'})
     
     data = request.get_json()
@@ -121,7 +172,7 @@ def chat():
     if not question:
         return jsonify({'error': 'No question provided'})
     
-    relevant = get_relevant_chunks(question, vectorizer, tfidf_matrix, chunks)
+    relevant = get_relevant_chunks(question, chunks)
     context = "\n\n".join(relevant)
     answer = ask_gemini(api_key, question, context)
     
